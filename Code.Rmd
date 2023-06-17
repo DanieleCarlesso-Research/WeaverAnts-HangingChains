@@ -1,0 +1,1741 @@
+---
+title: "A simple mechanism for collective decision-making in the absence of payoff
+  information"
+author: "Daniele Carlesso"
+date: '2023'
+output: html_document
+---
+
+This document contains all analyses on the hanging chain behavior in weaver ants (Oecophylla smaragdina). 
+
+```{r setup}
+
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+
+if (!require(librarian)) {
+  install.packages("librarian")
+  library(librarian)
+}
+
+shelf(tidyverse, lme4, survival, glmmTMB, ggeffects, sjPlot, lmerTest, deSolve, DHARMa, survminer, data.table, viridis, scales, patchwork, profvis, COEF, ggh4x)
+
+# Load predict method for tls plots
+predictdf.TLS <- function(model, xseq, se, level) {
+  pred <- as.numeric(model[[1]] %*% t(cbind(1, xseq)))
+  if(se) {
+    preds <- sapply(1:length(model[[2]]), function(x) as.numeric(c(model[[2]][x],model[[3]][x]) %*% t(cbind(1, xseq))))
+    data.frame(
+      x = xseq,
+      y = pred,
+      ymin = apply(preds, 1, function(x) quantile(x, probs = (1-level)/2)),
+      ymax = apply(preds, 1, function(x) quantile(x, probs = 1-((1-level)/2)))
+    )
+  } else {
+    return(data.frame(x = xseq, y = pred))
+  }
+}
+
+```
+
+# . MAIN ANALYSES
+
+## . Position of joining over the chain
+
+```{r, warning=FALSE}
+
+## Load dataset
+join_dist_reg <-read.csv("joining_distance.csv")
+
+## Calculate proportions of attaching ants at the various points of the chain (area under curve)
+DensityFunction = approxfun(density(join_dist_reg$tip_distance))
+
+AreaUnderCurve = function(lower, upper) {
+    integrate(DensityFunction, lower=lower, upper=upper) }
+
+## Find 95% of data
+quantile(join_dist_reg$tip_distance, probs = c(0.025, 0.975))
+
+x <- join_dist_reg$tip_distance
+
+MinToZero <- round(with(density(x, from = -7, to = 0), sum(y * diff(x)[1])), digits = 2)*100
+ZeroToTen <- round(with(density(x, from = 0, to = 10), sum(y * diff(x)[1])), digits = 2)*100
+TenToMax <- round(with(density(x, from = 10), sum(y * diff(x)[1])), digits = 2)*100
+
+redline <- density(x, from = -5.014442, to = 14.977483)
+
+a <- density(x, from = round(min(x)), to = 0)
+b <- density(x, from = 0, to = 10)
+c <- density(x, from = 10)
+
+ChainWalked_plot_upd <- ggplot() +
+  geom_line(data.frame(a), mapping = aes(x = a$x, y = a$y)) +
+  geom_line(data.frame(b), mapping = aes(x = b$x, y = b$y)) +
+  geom_line(data.frame(c)[c$x <= max(x),], mapping = aes(x = x, y = y)) +
+  geom_line(data.frame(redline), mapping = aes(x = redline$x, y = redline$y), col = "red", lwd = 1) +
+  geom_area(aes(x = stage(join_dist_reg$tip_distance,
+                          after_stat = scales::oob_censor(x, c(-7, 0))),
+                fill = "#0000FFA0"),
+            stat = "density",
+            alpha = .4) +
+  theme_pubr(base_size = 20,
+             legend = "none") + 
+    geom_area(aes(x = stage(join_dist_reg$tip_distance,               
+                          after_stat = scales::oob_censor(x, c(-0, 10))),
+                fill = "#A0A0A0A0"),
+            stat = "density",
+            alpha = .4) +
+    geom_area(aes(x = stage(join_dist_reg$tip_distance, 
+                          after_stat = scales::oob_censor(x, c(10, max(join_dist_reg$tip_distance)))),
+                fill = "#FF0000A0"),
+            stat = "density",
+            alpha = .4) +
+  xlab("Distance from chain tip (mm)") +
+  geom_segment(aes(x = mean(join_dist_reg$tip_distance), y = 0, xend = mean(join_dist_reg$tip_distance), yend = 0.11), 
+               color = "blue", linetype = 2, size = 1) +
+    labs(y = "density") +
+  scale_fill_brewer(palette = "Dark2",                 ## color blind vision friendly
+                    name = "Percentage of ants",
+                    direction = -1,
+                    guide = "legend",
+                    labels = c(paste0(MinToZero, "%"), paste0(ZeroToTen, "%"), paste0(TenToMax, "%"))) + 
+  guides(fill = guide_legend(override.aes = list(alpha = 0.2))) +
+  theme_pubr(base_size = 20,
+             legend = c(0.75, 0.84)) +
+    scale_x_continuous(breaks = c(round(min(join_dist_reg$tip_distance)), 0, 10, 20),
+                     labels = c(round(min(join_dist_reg$tip_distance)), 0, 10, 20)) +
+  geom_segment(aes(x = -5.014442, y = 0, xend = 14.977483, yend = 0), lwd = 1, col = "red") +
+  geom_segment(aes(x = -5.014442, y = 0, xend = -5.014442, yend = 0.0337), lwd = 1, col = "red") +
+  geom_segment(aes(x = 14.977483, y = 0, xend = 14.977483, yend = 0.011), lwd = 1, col = "red") 
+
+
+ChainWalked_plot_upd
+
+```
+
+### . Probability of joining beyond the tip of the chain
+
+```{r}
+
+## Load dataset
+joining_distance <- read.csv("joining_distance.csv") %>%
+  mutate(scaled.GapHeight = scale(GapHeight, scale = T, center = T), # center variables
+         scaled.gaplength = scale(gaplength, scale = T, center = T),
+         lengthen = ifelse(Scaled_y > tip_y, 1, 0)) # binarize response
+
+# Fit logistic model
+lengthen_mod <- glmmTMB(lengthen ~ scaled.GapHeight + scaled.gaplength + scaled.GapHeight : scaled.gaplength + (1|RepName), data = joining_distance, family = binomial)
+
+# Model diagnostic
+res <- simulateResiduals(lengthen_mod, n = 1000)
+testQuantiles(res)
+testDispersion(res)
+testZeroInflation(res)
+testUniformity(res)
+testOutliers(res)
+
+# See model results
+summary(lengthen_mod)
+
+## Get model predictions
+pred_lengthen_gl <- ggeffect(lengthen_mod, terms = "scaled.gaplength") 
+
+## Unscale variable before plotting
+pred_lengthen_gl$unscaled <- pred_lengthen_gl$x * attr(joining_distance$scaled.gaplength, 'scaled:scale') + attr(joining_distance$scaled.gaplength, 'scaled:center')
+
+# Create plot object
+lengthen_plot <- ggplot(pred_lengthen_gl, aes(unscaled, predicted)) +
+  geom_line(size = .7) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = .1, fill = "red") +
+  theme_classic() +
+  labs(x = "Distance from target platform (mm)", y = "probability to lengthen the chain") +
+  ylim(0, 1) +
+  theme_pubr(margin = T, base_size = 20, base_family = "Times New Roman") 
+
+## Visualize plot
+lengthen_plot
+
+```
+
+
+# . Analysis of leaving positions of ants
+
+```{r}
+
+leaving_positions <- read.csv("leaving_positions.csv")
+
+leavedist <- leaving_positions$distancefromtip
+
+al <- density(leavedist, to = 10)
+bl <- density(leavedist, from = 10)
+
+TipArea <- round(with(al, sum(y * diff(x)[1])), digits = 2)*100
+OtherArea <- round(with(bl, sum(y * diff(x)[1])), digits = 2)*100
+redline <- density(leavedist, from = 0, to = 10)
+
+leave_position_plot <- ggplot() +
+  geom_density(data = leaving_positions, aes(x = distancefromtip)) +
+  geom_area(aes(x = stage(leaving_positions$distancefromtip,
+                          after_stat = scales::oob_censor(x, c(10, 30))),
+                fill = "#0000FFA0"),
+            stat = "density",
+            alpha = .4) +
+  geom_area(aes(x = stage(leaving_positions$distancefromtip,               
+                          after_stat = scales::oob_censor(x, c(0, 10))),
+                fill = "#A0A0A0A0"),
+            stat = "density",
+            alpha = .4) +
+  geom_segment(aes(x = mean(leavedist), y = 0, xend = mean(leavedist), yend = 0.165), 
+               color = "blue", linetype = 2, size = 1) +
+  labs(x = "Distance from chain tip (mm)", 
+       y = "density") +
+  scale_fill_brewer(palette = "Dark2",                 ## color blind vision friendly
+                    name = "Percentage of ants",
+                    direction = -1,
+                    guide = "legend",
+                    labels = c(paste0(OtherArea, "%"), paste0(TipArea, "%"))) + 
+  guides(fill = guide_legend(override.aes = list(alpha = 0.2,
+                                                 color = NA),
+                             reverse = T)) +
+  theme_pubr(base_size = 20,
+             legend = c(0.75, 0.88)) +
+    scale_x_continuous(breaks = c(round(min(leavedist)), 0, 10, 20),
+                     labels = c(round(min(leavedist)), 0, 10, 20),
+                     limits = c(0, 25)) ; leave_position_plot
+
+
+## Time spent by ants that we followed
+timespent <- read.csv("timespent.csv")
+
+summary(timespent$duration)
+
+mean(timespent$duration)
+sd(timespent$duration)
+min(timespent$duration)
+max(timespent$duration)
+
+
+```
+
+# . Analysis of chain length change before and after leaving event (from elsewhere than the tip)
+
+```{r}
+
+chain_growth <- read.csv("chain_growth.csv")
+leave_10 <- read.csv("leave_10.csv")
+
+chain_length_L <- data.frame()
+for (i in 1:nrow(leave_10)) {
+  
+  df <- leave_10[i,]
+  before <- mean(chain_growth[chain_growth$Rep == df$Rep & 
+                      between(chain_growth$Slice, df$from, df$Slice),]$funct_y)*-1
+  after <- mean(chain_growth[chain_growth$Rep == df$Rep & 
+                      between(chain_growth$Slice, df$Slice, df$to),]$funct_y)*-1
+  
+  out <- data.frame(ID = df$ID,
+                    before = before, 
+                    after = after)
+  
+  chain_length_L <- rbind(chain_length_L, out)
+  
+  
+}
+
+chain_length_w <- chain_length_L %>%
+  mutate(change = after - before) %>%
+  pivot_longer(names_to = "when", cols = c(before, after)) %>%
+  mutate(funct_y = value) 
+
+ggplot(chain_length_w, aes(x = when, y = funct_y, group = ID, color = ID)) +
+  geom_pointpath() +
+  scale_x_discrete(limits=rev, labels = c("Before leaving event",
+                                          "After leaving event"),
+                   expand = expansion(mult = 0.2)) +
+  ylim(15, 50) +
+  theme_538(base_size = 15) +  
+  theme(legend.position = "none",
+        panel.border = element_rect(colour = "black", fill=NA, linewidth=2)) +
+  labs(x = "",
+       y = "Length of chain (mm)") +
+  geom_text(data = chain_length_w[chain_length_w$when == "before" & 
+                                    chain_length_w$ID != "A7_32_50" & 
+                                    chain_length_w$ID != "A3_50_50",], 
+            aes(y = funct_y + 0.3, x = 2.07, label = round(change, digits = 2))) +
+  geom_text(data = chain_length_w[chain_length_w$when == "before" &
+                                    chain_length_w$ID == "A7_32_50",], 
+            aes(y = funct_y + 0.5, x = 2.07, label = round(change, digits = 2))) + 
+  geom_text(data = chain_length_w[chain_length_w$when == "before" &
+                                    chain_length_w$ID == "A3_50_50",], 
+            aes(y = funct_y - 0.5, x = 2.07, label = round(change, digits = 2)))
+  
+mean(chain_length_w[chain_length_w$when == "before",]$change)
+sd(chain_length_w[chain_length_w$when == "before",]$change)
+
+
+```
+
+### . Probability of joining and leaving the structure 
+
+#### . Joining probability
+
+```{r}
+
+# Load dataset
+join_growth <- read.csv("JL_chaingrowth.csv") %>%
+  filter(Behavior != "Extension") %>%
+  mutate(scaled.gaplength = scale(gaplength_j, center = T, scale = T),
+         scaled.GapHeight = scale(GapHeight, center = T, scale = T))
+
+# Fit logistic model
+join_mod <- glmer(Join ~ scaled.gaplength + scaled.GapHeight + scaled.gaplength:scaled.GapHeight + traf_join_down + traf_join_up + (1|RepName), 
+                  data = join_growth,
+                  family = binomial,
+                  glmerControl(optimizer = "Nelder_Mead"))
+
+# Residual diagostics
+res <- simulateResiduals(join_mod, n = 1000)
+testUniformity(res)
+testDispersion(res)
+testQuantiles(res)
+testZeroInflation(res)
+
+# Results
+summary(join_mod)
+
+# Plot 
+## Predict values from model
+pred_join_gl <- ggeffect(join_mod, terms = "scaled.gaplength")
+
+## Unscale variables before plotting
+pred_join_gl$unscaled <- pred_join_gl$x * attr(join_growth$scaled.gaplength, 'scaled:scale') + attr(join_growth$scaled.gaplength, 'scaled:center')
+
+# Create plot for gaplength
+join_plot1 <- ggplot(pred_join_gl, aes(unscaled, predicted)) +
+  geom_line(size = .5) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = .1, fill = "red") +
+  ylim(0, 1) +
+  theme_classic() +
+  labs(x = "Distance from platform (mm)", y = "Probability to join the chain") 
+
+# Forest plot of the model
+join_plot2 <- plot_model(join_mod,
+                         title = "",
+                         show.p = TRUE,
+                         axis.lim=c(.08, 5), 
+                         dot.size = 4, 
+                         line.size = 1.6) +
+  scale_x_discrete(labels=c(
+    scaled.GapHeight = "Experimental condition",
+    scaled.gaplength = "Distance from platform",
+    'scaled.gaplength:scaled.GapHeight' = "Experimental condition*\nDistance from platform",
+    traf_join_down = "Traffic down",
+    traf_join_up = "Traffic up")) +
+  scale_color_brewer(palette = "Dark2", direction = -1) +
+  theme_pubr(base_size = 15) +
+  scale_y_continuous(labels = c(0.1, 1, 2, 3), 
+                     breaks = c(0.1, 1, 2, 3)) +
+  geom_hline(aes(yintercept = 1), linetype = 2);join_plot2
+
+## Visualize plot
+join_plot1
+join_plot2
+
+```
+
+#### . Leaving probability
+
+```{r}
+
+## Load dataset
+leave_df <- read.csv("JL_chaingrowth.csv") %>%
+  filter(Behavior != "Extension", 
+         Join == 1)  # Only ants that joined can leave
+
+## Calculate number of ants joining while focal ant is in the structure
+njoin_df <- list()
+for (i in 1:nrow(leave_df)) {
+  df <- leave_df[i,]
+  Rep <- df$RepName
+  start <- df$tstart_l
+  stop  <- df$tstop_l
+  df$njoin <- nrow(leave_df[between(leave_df$tstop_j, start, stop) & 
+                              leave_df$Subject != df$Subject & 
+                              leave_df$RepName == Rep,])
+  njoin_df[[length(njoin_df) + 1]] <- df
+}
+
+## Re-create updated dataframe
+leave_df <- do.call(rbind, njoin_df)
+
+## Tidy dataframe
+leave_df <- leave_df %>%
+  select(c("GapHeight", "RepName", "Subject", "Leave", "time_spent", "traf_leave_down", "traf_leave_up", "gaplength_l", "njoin"))
+
+## Transform njoin in rate (Rjoin) to normalize it over time
+leave_df$Rjoin <- leave_df$njoin/leave_df$time_spent
+
+## Create surv object
+leave_surv <- Surv(leave_df$time_spent, leave_df$Leave, type = "right")
+
+## Fit model
+leave_mod <- coxph(Surv(leave_df$time_spent, leave_df$Leave, type = "right") ~ gaplength_l + traf_leave_down + traf_leave_up + Rjoin, data = leave_df)
+
+## COx model diagnostics
+## PH assumptions are respected
+cox.zph(leave_mod)
+
+## Results
+summary(leave_mod)
+
+## Visualize effects
+## Effect of gaplength on leaving probability
+newdata_gl <- data.frame(gaplength_l = c(quantile(leave_df$gaplength_l)[[1]], 
+                                         quantile(leave_df$gaplength_l)[[5]]),
+                         traf_leave_up = mean(leave_df$traf_leave_up), 
+                         traf_leave_down   = mean(leave_df$traf_leave_down),
+                         Rjoin = mean(leave_df$Rjoin))
+
+# plot
+leaveplot_gl <- ggsurvplot(survfit(leave_mod, newdata = newdata_gl), 
+                           data = leave_df,
+                           conf.int = F,
+                           title = "Distance from target platform",
+                           legend.title = "",
+                           legend.labs = c("5.29mm",
+                                           "39.29mm"),
+                           ylim = c(0, 1),
+                           xlim = c(0, 75),
+                           palette = c("#d95f02", "#7570b3"),
+                           size = 1.5)[[1]] +
+  theme_pubr(base_size = 20,
+             legend = c(0.5, 0.1)) +
+  theme(legend.key.size = unit(.7, "cm"),
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        legend.text = element_text(size = 20),
+        legend.title = element_blank(),
+        legend.direction = "horizontal"); leaveplot_gl
+             
+
+# Effect of traffic up on leaving probability
+newdata_tfup <- data.frame(gaplength_l = mean(leave_df$gaplength_l),
+                           traf_leave_up = c(quantile(leave_df$traf_leave_up)[[1]],
+                                             quantile(leave_df$traf_leave_up)[[5]]), 
+                           traf_leave_down   = mean(leave_df$traf_leave_down),
+                           Rjoin = mean(leave_df$njoin))
+
+# plot
+leaveplot_tfup <- ggsurvplot(survfit(leave_mod, newdata = newdata_tfup), 
+                             data = leave_df, 
+                             conf.int = F,
+                             title = "Traffic leaving chain's tip",
+                             legend.title = "Leaving traffic rate:",
+                             legend.labs = c("0 ants/s",
+                                             "0.57 ants/s"),
+                             ylim = c(0, 1),
+                             xlim = c(0, 75),
+                             palette = c("#d95f02", "#7570b3"),
+                             size = 1.5,
+                             legend = c(0.5, 0.05))[[1]]  +
+  theme_pubr(base_size = 20,
+             legend = c(0.5, 0.1)) +
+  theme(legend.key.size = unit(.7, "cm"),
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        legend.text = element_text(size = 20),
+        legend.title = element_blank(),
+        legend.direction = "horizontal"); leaveplot_tfup
+
+
+
+# Effect of traffic down on leaving probability
+newdata_tfdw <- data.frame(gaplength_l = mean(leave_df$gaplength_l),
+                           traf_leave_up   = mean(leave_df$traf_leave_up),
+                           traf_leave_down = c(quantile(leave_df$traf_leave_down)[[1]],
+                                               quantile(leave_df$traf_leave_down)[[5]]),
+                           Rjoin = mean(leave_df$njoin))
+
+# plot
+leaveplot_tfdw <- ggsurvplot(survfit(leave_mod, newdata = newdata_tfdw), data = leave_df, 
+                          conf.int = F,
+                          title = "Traffic arriving at chain's tip",
+                          legend.title = "Arriving traffic rate:",
+                          legend.labs = c("0 ants/s",
+                                          "0.59 ants/s"),
+                          xlim = c(0, 75),
+                          palette = c("#d95f02", "#7570b3"),
+                          size = 1.5,
+                          legend = c(0.5, 0.05))[[1]] +
+  theme_pubr(base_size = 20,
+             legend = c(0.5, 0.1)) +
+  theme(legend.key.size = unit(.7, "cm"),
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        legend.text = element_text(size = 20),
+        legend.title = element_blank(),
+        legend.direction = "horizontal"); leaveplot_tfdw
+
+```
+
+#### . Reaching behaviour
+
+```{r}
+
+# Load dataset
+Extension_df <- read.csv("JL_chaingrowth.csv") %>%
+  filter(Behavior == "Extension") %>%
+  filter(tstop_j - tstart_j != 0) %>% 
+  mutate(scaled.GapHeight = scale(GapHeight, center = T, scale = T),
+         scaled.gaplength = scale(gaplength_j, center = T, scale = T))
+
+# Fit logistic model
+extend_mod <- glmer(Extend ~ scaled.GapHeight + scaled.gaplength + scaled.gaplength : scaled.GapHeight + traf_join_up + traf_join_down + (1|RepName), 
+                    data = Extension_df, 
+                    family = binomial, 
+                    glmerControl(optimizer = "Nelder_Mead"))
+
+## Residual diagnostics
+res <- simulateResiduals(extend_mod, n = 1000)
+testUniformity(res)
+testDispersion(res)
+testQuantiles(res)
+testZeroInflation(res)
+
+## See results
+summary(extend_mod)
+
+# Prediction for plotting
+pred_extend <- ggeffect(extend_mod, terms = c("scaled.gaplength"))
+
+# Unscale variable before plotting
+pred_extend$unscaled <- pred_extend$x * attr(Extension_df$scaled.gaplength, "scaled:scale") + attr(Extension_df$scaled.gaplength, "scaled:center")
+
+extend_plot1 <- ggplot(pred_extend, aes(unscaled, predicted)) +
+  geom_line() +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = .1, fill = "red") +
+  theme_pubr(base_size = 20) +
+  labs(x = "Distance from target platform (mm)", y = "Probability of displaying reaching behavior") 
+
+extend_plot1
+
+```
+
+#### . Latency to join the chain is not modulated by state of the structure
+
+```{r}
+
+# Load dataset 
+joinlatency_df <- read.csv("JL_chaingrowth.csv") %>%
+  filter(Behavior != "Extension") %>%
+  filter(Join == 1) 
+
+# Create survival object
+join_latency <- Surv(joinlatency_df$latency_tojoin, joinlatency_df$Join, type = "right")
+
+# Fit survival model
+join_latency_mod <- coxph(join_latency ~ gaplength_latency + GapHeight:gaplength_latency + traf_join_down + traf_join_up, data = joinlatency_df)
+
+# Diagnostics
+cox.zph(join_latency_mod)
+
+# Results
+summary(join_latency_mod)
+
+```
+
+## . Analytical model
+
+### . Parameter estimation from experiments
+
+#### .  Probability of joining
+
+The probability of joining is constant over time. We calculate the baseline probability of joining from the statistical model at the average conditions of the chain. 
+
+```{r}
+
+## Probability of joining the chain at average values
+average_data <- data.frame(
+  scaled.gaplength = mean(join_growth$scaled.gaplength),
+  scaled.GapHeight = mean(join_growth$scaled.GapHeight),
+  traf_join_down = mean(join_growth$traf_join_down),
+  traf_join_up = mean(join_growth$traf_join_up))
+
+## This is the baseline probability of joining the chain.
+joining_probability <- predict(join_mod, newdata = average_data, re.form = ~0, type = "response")
+
+joining_probability
+
+```
+
+#### . Probability of leaving the chain
+The probability of leaving depends largely on the distance from the visual target. 
+
+```{r}
+
+# Calculate decay rate for each experiment
+pred <- list()
+for (GL in seq(0, max(leave_df$gaplength_l), 1)) {
+  
+  # New dummy dataframe with variable number of ants
+  newdata_prediction <- data.frame(gaplength_l = GL,
+                                   traf_leave_up = mean(leave_df$traf_leave_up), 
+                                   traf_leave_down = mean(leave_df$traf_leave_down),
+                                   Rjoin = mean(leave_df$Rjoin))
+  
+  
+  # Build dataframe with survival time and survival probability
+  survival_df <- data.frame(survfit(leave_mod, newdata = newdata_prediction, censor = T, start.time = 0)$time,
+                            survfit(leave_mod, newdata = newdata_prediction, censor = T, start.time = 0)$surv)
+  
+  # rename columns
+  colnames(survival_df) <- c("time", "surv") 
+  
+  survival_df <- survival_df %>%
+    filter(time < 80)
+  
+  # Take log of survival probability
+  survival_df$survlog <- log(survival_df$surv) 
+  
+  # Fit linear model to find constant decay rate
+  survival_logmod <- lm(survlog ~ time, survival_df)
+
+  # Extract slope
+  slope <- survival_logmod$coefficients[["time"]]
+
+  # Write in list
+  pred[[length(pred) + 1]] <- data.frame(gaplength = GL, R = slope)
+
+}
+
+# Transform in dataframe
+predictions <- do.call(rbind, pred)
+
+# Take log of the survival estimates (linarization)
+predictions$logR <- log(-predictions$R)
+
+# Fit linear regression
+R_logmod <- lm(logR ~ gaplength, predictions)
+
+# Extract coefficients from the model
+Pl0 <- R_logmod$coefficients[1]
+slope <- R_logmod$coefficients[2]
+
+# Fit exponential curve to model predictions
+w_plot <- ggplot(predictions, aes(gaplength, -R)) +
+  geom_point() +
+  geom_line(aes(x = gaplength, y = exp(Pl0)*exp(slope*gaplength)), color = "blue", size = 1) +
+  labs(x = "Distance from target platform (mm)",
+       y = "W (decay rate)") +
+  theme_pubr() 
+  
+w_plot
+
+```
+
+##### . Alternative model decay rate
+
+In the alternative model, where the probability of leaving is independent of **S(t)**, we calculate **w** using the estimated survival probability of ants at the average conditions of the chain. 
+
+```{r}
+
+# Average chain conditions
+newdata_prediction <- data.frame(gaplength_l = mean(leave_df$gaplength_l),
+                                 traf_leave_up = mean(leave_df$traf_leave_up),
+                                 traf_leave_down = mean(leave_df$traf_leave_down),
+                                 Rjoin = mean(leave_df$Rjoin))
+
+# Build dataframe with survival time and survival probability
+survival_df <- data.frame(survfit(leave_mod, newdata = newdata_prediction, censor = T, start.time = 0)$time,
+                          survfit(leave_mod, newdata = newdata_prediction, censor = T, start.time = 0)$surv)
+# rename columns
+colnames(survival_df) <- c("time", "surv")
+
+survival_df <- survival_df %>%
+  filter(time < 80)
+
+# Take log of survival probability
+survival_df$survlog <- log(survival_df$surv)
+
+# Fit linear model to find constant decay rate
+survival_logmod <- lm(survlog ~ time, survival_df)
+
+# Extract slope
+slope.avg <- survival_logmod$coefficients[["time"]]
+
+wplot.complete <- w_plot +
+  geom_line(aes(y = slope.avg*-1), color = "dark green", size = 1, linetype = 1) +
+  theme_pubr(base_size = 20); wplot.complete
+
+```
+
+
+#### . Relationship between number of ants and length of the chain
+
+```{r}
+
+cumsum_df <- read.csv("cumsum_df.csv")
+
+# Fit linear regression
+mod_nlength <- lmer(chainlength ~ Nants + (1|RepName), cumsum_df)
+
+## Model diagnostics
+res <- simulateResiduals(mod_nlength, n = 1000)
+testResiduals(res)
+
+# Visualize fit lm
+Nants_length_plot <- ggplot(cumsum_df, aes(Nants, chainlength)) +
+  geom_point() +
+  geom_line(aes(y = fixef(mod_nlength)[1] + fixef(mod_nlength)[2]*Nants), color = "blue", size = 1) +
+  theme_pubr(base_size = 20) +
+  xlab("Number of ants in the chain") +
+  ylab("Length of the chain (mm)") 
+
+Nants_length_plot
+
+```
+
+### . Fit analytical model
+
+Here we fit the analytical models.  
+
+```{r}
+
+# Load data on chain growth
+growth_data <- read.csv("growth_data.csv") %>%
+  separate("RepName", "GapHeight", sep = "_", remove = F, extra = "drop") %>%
+  arrange(RepName, to)
+
+# Loop 
+chain.size = list()
+for ( Rep in unique(growth_data$RepName)) {
+  
+  # Extract Experimental Condition from data
+  G <- as.numeric(growth_data[growth_data$RepName == Rep,]$GapHeight[1])
+  
+  # Find maximum duration of each experiment
+  duration = tail(ceiling(growth_data[growth_data$RepName == Rep,]$start), 1)
+  
+  # Extract traffic
+   ## Traffic is used as rate over 10 seconds
+   ## We input the exact traffic for each replicate, which will change every 10 seconds 
+  Tr.Rep = growth_data[growth_data$RepName == Rep,] %>%
+    select(start, to, traf_bottom_down) %>%
+    mutate(traffic.rate = traf_bottom_down/10)
+  
+  # Probability of joining is fixed 
+  Pj = joining_probability
+  
+  # Estimated coefficients for decay rate calculation
+  R = R_logmod$coefficients[2]
+  Pl.complete = exp(R_logmod$coefficients[1])
+
+  # Set chain size at 0 (no ants in the chain)
+  Size.t = 0 
+  Size.t.avg = 0
+  
+  # Set time step of 0.5 seconds
+  timestep = 0.5
+  for (t in seq(10, duration, timestep)) {
+
+    # Extract traffic rate 
+    Tr = Tr.Rep[t >= Tr.Rep$start & t < Tr.Rep$to,]$traffic.rate
+    
+    # Calculate length of the chain for current value of S
+    L = fixef(mod_nlength)[1] + fixef(mod_nlength)[2]*Size.t
+
+    # Calculate distance from platform by removing estimated chain length from full gap 
+    gaplength = G - L
+    
+    # Calculate decay rate for current gaplength
+    w = Pl.complete*exp(R*gaplength)
+    
+    # Average model has fixed decay rate 
+    w.avg = -slope.avg                                 
+    
+    # Find current size of chain
+    # Our model
+    Size = Size.t + (Pj * Tr - w * Size.t)*(timestep)
+
+    # # Average model 
+    Size.avg = Size.t.avg + (Pj * Tr - w.avg * Size.t.avg)*(timestep)
+
+    # Store results for next time step
+    Size.t = Size
+    Size.t.avg = Size.avg
+    
+    # Export results
+    chain.size[[length(chain.size) + 1]] <- data.frame(RepName = Rep,
+                                                       GapHeight = G,
+                                                       gaplength = (G-L),
+                                                       chainlength_model = L,
+                                                       time = t, 
+                                                       S = Size,
+                                                       S.avg = Size.avg)
+    
+  }
+  
+}
+
+# List to dataframe
+Size.avgmodel <- rbindlist(chain.size)
+
+```
+
+### . Compare models
+
+```{r}
+
+Compare.avgmodel <- merge(cumsum_df, Size.avgmodel, all.x = T, all.y = F, by = c("RepName", "time", "GapHeight")) %>%
+  arrange(RepName, time) %>%
+  # select(GapHeight, RepName, time, Nants, S, S.avg) %>%
+  setnames("S", "model") %>%
+  setnames("Nants", "experimental") %>%
+  setnames("S.avg", "model.avg") %>%
+  pivot_longer(cols = c(model, experimental, model.avg)) %>%
+  setnames("name", "data") %>%
+  setnames("value", "Nants")%>%
+  mutate(labels = paste0("Target distance: ", GapHeight, "mm"),
+         labels1 = paste0(GapHeight, "mm")) 
+
+k = 1
+dff <- list()
+for (i in unique(Compare.avgmodel$RepName)){
+  df <- Compare.avgmodel[Compare.avgmodel$RepName == i,]
+  df$Rep <- paste0(df$GapHeight, "mm_Rep", k)
+  dff[[length(dff) + 1]] <- df
+  k <- k + 1
+  if (k > 5) {k = 1}
+}
+
+Compare.avgmodel <- rbindlist(dff)
+
+# Plot comparison
+plotReps <- ggplot(Compare.avgmodel, aes(time, Nants, color = data)) +
+  geom_point() +
+  geom_line() +
+  facet_wrap2("Rep", axes = T, remove_labels = F, ncol = 5) +
+  labs(x = "Time (s)", 
+       y = "Number of ants in the chain") +
+  theme(legend.position = "right", 
+        legend.title = element_blank()) +
+  theme_pubr(base_size = 20) +
+  scale_fill_brewer(palette = "Dark2", direction =-1,  aesthetics = c("colour", "fill"),
+                    labels = c("Experimental", "Distance-dependent model", "Distance-independent model")) 
+
+# Comparison between experimental and modelling data AVERAGE
+avg.plot <- ggplot(Compare.avgmodel, aes(time, Nants, fill = data)) +
+  stat_summary(fun.data = mean_se,geom = "point", aes(color = data)) +
+  stat_summary(fun=mean,geom="line", aes(color = data)) +
+  stat_summary(geom="ribbon", alpha = .4) +
+  scale_fill_brewer(palette = "Dark2", direction = -1,  
+                    aesthetics = c("colour", "fill"),
+                    labels = c(" Experimental ", " Distance-dependent model ", " Distance-independent model "),
+                    name = " ") +
+  facet_wrap("labels1") +
+  labs(x = "Time (s)", 
+       y = "Number of ants in the chain") +
+  theme(legend.title = element_blank()) +
+  theme_classic() +
+  theme_pubr(base_size = 20, legend = "top") +
+  theme(strip.text.x = element_text(size = 20),
+        legend.key.size = unit(.9, "cm"),
+        legend.text = element_text(size = 20))  + 
+  ylim(0,30) ; avg.plot
+
+
+# Create dataframe for estimatin glinear correlations
+Compare.linear <- merge(cumsum_df, Size.avgmodel, all.x = T, all.y = F, by = c("RepName", "time", "GapHeight")) %>%
+  arrange(RepName, time) %>%
+  select(GapHeight, RepName, time, Nants, S, S.avg) %>%
+  setnames("S", "model") %>%
+  setnames("Nants", "experimental") %>%
+  setnames("S.avg", "model.avg") %>%
+  pivot_longer(cols = c(model, model.avg)) %>%
+  setnames("name", "data") %>%
+  setnames("value", "Nants") %>%
+  mutate(labels = paste0("Target distance: ", GapHeight, "mm"),
+         labels1 = paste0(GapHeight, "mm"))
+
+linearplot <- ggplot(Compare.linear, aes(x = experimental, y = Nants, color = data, fill = data)) +
+  geom_point() +
+  geom_abline(aes(intercept = 0, slope = 1)) +
+  facet_wrap("labels1") +
+  theme_classic() +
+  labs(title = "",
+       x = "Experimental (n° of ants)",
+       y     = "Model (n° of ants)") +
+  geom_smooth(method = COEF::tls) +
+  theme_pubr(base_size = 20, legend = "top") +
+  scale_color_manual(values = c("#d95f02","#1b9e77"),
+                     labels = c(" Distance-dependent model ", " Distance-independent model "),
+                     name = " ") +
+  scale_fill_manual(values = c("#d95f02","#1b9e77"),
+                    labels = c(" Distance-dependent model ", " Distance-independent model "),
+                    name = " ") + 
+  theme(strip.text.x = element_text(size = 20), 
+        legend.key.size = unit(.55, "cm"),
+        legend.text = element_text(size = 20)) 
+  
+avg.plot
+linearplot 
+plotReps 
+
+```
+
+### . Explore chains using modelling
+
+```{r Distance-dependent model}
+
+# Assign names to variables
+Pj = joining_probability
+R = R_logmod$coefficients[2]
+Pl.complete = exp(R_logmod$coefficients[1])
+Tr.variance.avg = var(growth_data$traf_bottom_down/10)
+max.time = max(growth_data$to)
+slope.nlength <- fixef(mod_nlength)[2]
+intercept.nlength <- fixef(mod_nlength)[1]
+
+GapHeight = seq(10, 120, length.out = 41)
+Traffic.mean = seq(0, 2, length.out = 41)
+simulation.dataframe <- expand.grid(GapHeight, Traffic.mean)
+colnames(simulation.dataframe) <- c("GapHeight", "Traffic.mean")
+GapHeight.vec <- simulation.dataframe$GapHeight 
+Traffic.mean.vec <- simulation.dataframe$Traffic.mean
+
+# Function that outputs final chain length and time for each combination of traffic and GapHeight
+simulateChain <- function(i, GH.vec, Tr.mean.vec, simulations) {
+  
+  GH = GH.vec[i]
+  Tr.mean = Tr.mean.vec[i]
+  
+  # Calculate parameters for gamma distribution
+  s = Tr.variance.avg/Tr.mean
+  a = Tr.mean/s
+
+  Tr.vec <- rgamma(
+    n = simulations*501,
+    shape = a,
+    scale = s
+  )
+  # Counter for traffic
+  counter.Tr = 1
+  
+  # Loop for simulations
+  total.df <- vector("list", 1e5)
+  for (sim in 1:simulations) {
+    
+    # Set chain size at 0 at the beginning of each simulation
+    Size.t = 0
+    
+    # Start simulation
+    rep.list <- vector("list", 1e5)
+    # use counter to store values in list
+    counter = 1
+    time.step = 1
+    
+    for (t in seq(0, 500, time.step)) { ## 254s is the longest of my reps
+      
+      # Draw random traffic at each time step
+      Tr <- Tr.vec[counter.Tr]
+      
+      # Calculate length of the chain
+      Length.chain = intercept.nlength + slope.nlength*Size.t
+      
+      # Calculate distance from the platform
+      gaplength = GH - Length.chain
+
+      # Calculate decay rate 
+      w = Pl.complete*exp(R*gaplength)
+      w = ifelse(w > 1, 1, w)
+      
+      # Model
+      Size = Size.t + (Pj * Tr - w * Size.t)*(time.step)
+      
+      # Save size at each time step
+      Size.t <- Size
+      if (Size.t < 0) {Size.t = 0}
+      
+      # increase counter
+      counter = counter + 1
+      counter.Tr = counter.Tr + 1
+
+      # Store results of simulation
+      rep.list[[counter]] <- list(time = t,
+                                  S = Size.t,
+                                  L = Length.chain,
+                                  Tr = Tr.mean,
+                                  GapHeight = GH)
+      
+      # Stop loop when chain length covers full gap
+      if (Length.chain >= GH) {
+        break
+      }
+      
+    }
+    
+    # Output list 
+    total.df[[sim]] <- rbindlist(rep.list)
+    # Calculate slope for each simulation
+    slope = coefficients(lm(L ~ time, total.df[[sim]]))[2]
+    # Store slope results
+    total.df[[sim]][[6]] <- slope
+    names(total.df[[sim]])[[6]] <- "slope"
+    # Store simulation number
+    total.df[[sim]][[7]] <- sim
+    names(total.df[[sim]])[[7]] <- "simulation"
+    # Store iteration number
+    total.df[[sim]][[8]] <- i
+    names(total.df[[sim]])[[8]] <- "iteration"
+    
+
+  }
+  
+  # Put results in datatable
+  tot.df <- rbindlist(total.df)
+  
+  # Output list
+  tot.df
+  
+}
+
+### Run model ### 
+simulation.df <- rbindlist(lapply(1:length(GapHeight.vec), simulateChain, GH.vec = GapHeight.vec, Tr.mean.vec = Traffic.mean.vec, simulations = 100))
+
+```
+
+#### . Model results
+
+```{r}
+
+## Function to calculate median growth rate
+approxGrowth <- function(y, t) {
+  median(diff(y[order(t)]))
+}
+
+dat <- simulation.df
+
+dat <- dat %>%
+  group_by(GapHeight, Tr, time) %>%
+  summarise(L.avg = mean(L))
+
+dat <- data.table(dat)
+
+summ <- dat[, .(gr = approxGrowth(L.avg, time)), by = .(GapHeight, Tr)]
+
+# Plot tile plot
+SimulationTile_plot <- ggplot(summ[summ$Tr <= 1], aes(x = GapHeight, y = Tr)) +
+  geom_tile(aes(fill = gr)) +
+  stat_contour(aes(z = gr), color = "white", breaks = seq(0.01, 2, 0.25), linetype = 2) +
+  stat_contour(aes(z = gr), color = "green", breaks = 0.01, linetype = 2) +
+  coord_equal(ratio = max(summ$GapHeight) / max(summ$Tr)) +
+  scale_x_continuous(expand=c(0,0)) +
+  scale_y_continuous(expand=c(0,0)) +
+  scale_fill_viridis_c(option = "inferno",
+                       name = "growth 
+rate (mm/s)") +
+  labs(x = "Gap height (mm)", 
+       y = "Traffic (ants/sec)",
+       title = " ") +
+  theme_minimal(base_size = 20) +
+  theme(legend.title = element_text(),
+        legend.justification = c(0, 1),
+        legend.margin = margin(100, 0 , 0, 0),
+        legend.spacing.y = unit(10, "pt")); SimulationTile_plot
+
+ggpar(SimulationTile_plot,
+      font.main = c(20, "bold"),
+      font.x = c(20, "bold"),
+      font.y = c(20, "bold"),
+      font.caption = c(20, "bold"),
+      
+      font.tickslab = c(20, "bold"))
+
+Myexps <- join_growth %>%
+  group_by(RepName) %>%
+  summarise(GapHeight = GapHeight[1],
+    mean.Tr = mean(traf_join_down))
+
+SimulationTile_plot +
+ geom_point(data = Myexps, aes(GapHeight, mean.Tr), color = "white")
+
+```
+
+## . Predictions from alternative model
+
+```{r Distance-independent model}
+
+# Assign names to variables
+Pj = joining_probability
+R = R_logmod$coefficients[2]
+Pl.complete = exp(R_logmod$coefficients[1])
+Tr.variance.avg = var(growth_data$traf_bottom_down/10)
+max.time = max(growth_data$to)
+slope.nlength <- fixef(mod_nlength)[2]
+intercept.nlength <- fixef(mod_nlength)[1]
+slope.avg <- slope.avg
+
+# Create dataframe with values for simulation
+GapHeight = seq(10, 120, length.out = 41)
+Traffic.mean = seq(0, 2, length.out = 41)
+simulation.dataframe <- expand.grid(GapHeight, Traffic.mean)
+colnames(simulation.dataframe) <- c("GapHeight", "Traffic.mean")
+GapHeight.vec <- simulation.dataframe$GapHeight 
+Traffic.mean.vec <- simulation.dataframe$Traffic.mean
+
+# Function that outputs final chain length and time for each combination of traffic and GapHeight
+simulateChain <- function(i, GH.vec, Tr.mean.vec, simulations) {
+  
+  GH = GH.vec[i]
+  Tr.mean = Tr.mean.vec[i]
+  
+  # Calculate parameters for gamma distribution
+  s = Tr.variance.avg/Tr.mean
+  a = Tr.mean/s
+
+  Tr.vec <- rgamma(
+    n = simulations*501,
+    shape = a,
+    scale = s
+  )
+  # Counter for traffic
+  counter.Tr = 1
+  
+  # Loop for simulations
+  total.df <- vector("list", 1e5)
+  for (sim in 1:simulations) {
+    
+    # Set chain size at 0 at the beginning of each simulation
+    Size.t = 0
+    
+    # Start simulation
+    rep.list <- vector("list", 1e5)
+    # use counter to store values in list
+    counter = 1
+    time.step = 1
+    
+    for (t in seq(0, 500, time.step)) { ## 254s is the longest of my reps
+      
+      # Draw random traffic at each time step
+      Tr <- Tr.vec[counter.Tr]
+      
+      # Calculate length of the chain
+      Length.chain = intercept.nlength + slope.nlength*Size.t
+      
+      # Calculate distance from the platform
+      gaplength = GH - Length.chain
+      
+      # Calculate decay rate 
+      w = -slope.avg ## change sign to obtain positive decay rate
+      
+      # Model
+      Size = Size.t + (Pj * Tr - w * Size.t)*(time.step)
+      
+      # Save size at each time step
+      # Size.t = ifelse(Size < 0, 0, Size)
+      Size.t <- Size
+      if (Size.t < 0) {Size.t = 0}
+      
+      # increase counter
+      counter = counter + 1
+      counter.Tr = counter.Tr + 1
+
+      # Store results of simulation
+      rep.list[[counter]] <- list(time = t,
+                                  S = Size.t,
+                                  L = Length.chain,
+                                  Tr = Tr.mean,
+                                  GapHeight = GH)
+      
+      # Stop loop when chain length covers full gap
+      if (Length.chain >= GH) {
+        break
+      }
+      
+    }
+    
+    # Output list 
+    total.df[[sim]] <- rbindlist(rep.list)
+    # Calculate slope for each simulation
+    slope = coefficients(lm(L ~ time, total.df[[sim]]))[2]
+    # Store slope results
+    total.df[[sim]][[6]] <- slope
+    names(total.df[[sim]])[[6]] <- "slope"
+    # Store simulation number
+    total.df[[sim]][[7]] <- sim
+    names(total.df[[sim]])[[7]] <- "simulation"
+    # Store iteration number
+    total.df[[sim]][[8]] <- i
+    names(total.df[[sim]])[[8]] <- "iteration"
+    
+
+  }
+  
+  # Put results in datatable
+  tot.df <- rbindlist(total.df)
+  
+  # Output list
+  tot.df
+  
+}
+
+### Run model ### 
+simulation.avg.df <- rbindlist(lapply(1:length(GapHeight.vec), simulateChain, GH.vec = GapHeight.vec, Tr.mean.vec = Traffic.mean.vec, simulations = 100))
+
+```
+
+```{r}
+
+## Function to calculate median growth rate
+approxGrowth <- function(y, t) {
+  median(diff(y[order(t)]))
+}
+
+## Load simulated data
+dat1<- simulation.avg.df
+
+dat1 <- dat1 %>%
+  group_by(GapHeight, Tr, time) %>%
+  summarise(L.avg = mean(L))
+dat1 <- data.table(dat1)
+
+summ1 <- dat1[, .(gr = approxGrowth(L.avg, time)), by = .(GapHeight, Tr)]
+
+# Plot tile plot
+SimulationTile_avg_plot <- ggplot(subset(summ1, Tr <= 1)) +
+  aes(x = GapHeight, y = Tr) +
+  geom_tile(aes(fill = gr)) +
+  stat_contour(aes(z = gr), color = "white", breaks = seq(0.01, 2, 0.25), linetype = 2) +
+  stat_contour(aes(z = gr), color = "green", breaks = 0.01, linetype = 2) +
+  coord_equal(ratio = max(summ1$GapHeight) / max(summ1$Tr)) +
+  scale_x_continuous(expand=c(0,0)) +
+  scale_y_continuous(expand=c(0,0)) +
+  scale_fill_viridis_c(option = "inferno",
+                      direction = 1,
+                       name = "growth 
+rate (mm/s)") +
+  labs(x = "Gap height (mm)", 
+       y = "Traffic (ants/sec)",
+       title = " ") +
+  theme_minimal(base_size = 16) +
+  theme(legend.title = element_text(),
+        legend.justification = c(0, 1),
+        legend.margin = margin(100, 0 , 0, 0),
+        legend.spacing.y = unit(10, "pt")) 
+
+SimulationTile_avg_plot +
+  geom_point(data = Myexps, aes(GapHeight, mean.Tr), color = "white")
+
+```
+
+# . Time needed to complete a chain over a 110mm gap at the average traffic flow measured during our experiments
+
+```{r}
+
+GapHeight.vec = 110
+Traffic.mean.vec = 0.12
+
+### Run model ### 
+simulation.myexps <- rbindlist(lapply(1:length(GapHeight.vec), simulateChain, GH.vec = GapHeight.vec, Tr.mean.vec = Traffic.mean.vec, simulations = 100))
+
+## Function to calculate median growth rate
+approxGrowth <- function(y, t) {
+  median(diff(y[order(t)]))
+}
+
+## Load simulated data
+dat.myexps <-  simulation.myexps
+
+dat.myexps <- dat.myexps %>%
+  group_by(GapHeight, Tr, time) %>%
+  summarise(L.avg = mean(L))
+
+dat.myexps <- data.table(dat.myexps)
+
+summ.myexps <- dat.myexps[, .(gr = approxGrowth(L.avg, time)), by = .(GapHeight, Tr)]
+
+## Time needed to complete chain at estimated growth rate of alternative model
+(110/summ.myexps$gr)/60
+
+```
+
+# Additional simulations with distance from visual target constant
+
+```{r}
+
+# Assign names to variables
+Pj = joining_probability
+R = R_logmod$coefficients[2]
+Pl.complete = exp(R_logmod$coefficients[1])
+Tr.variance.avg = var(growth_data$traf_bottom_down/10)
+max.time = max(growth_data$to)
+slope.nlength <- fixef(mod_nlength)[2]
+intercept.nlength <- fixef(mod_nlength)[1]
+
+# Create dataframe with values for simulation
+GapHeight = seq(10, 120, length.out = 41)
+Traffic.mean = seq(0, 2, length.out = 41)
+simulation.dataframe <- expand.grid(GapHeight, Traffic.mean)
+colnames(simulation.dataframe) <- c("GapHeight", "Traffic.mean")
+GapHeight.vec <- simulation.dataframe$GapHeight 
+Traffic.mean.vec <- simulation.dataframe$Traffic.mean
+ 
+# Function that outputs final chain length and time for each combination of traffic and GapHeight
+simulateChain <- function(i, GH.vec, Tr.mean.vec, simulations) {
+  
+  GH = GH.vec[i]
+  Tr.mean = Tr.mean.vec[i]
+  
+  # Calculate parameters for gamma distribution
+  s = Tr.variance.avg/Tr.mean
+  a = Tr.mean/s
+
+  Tr.vec <- rgamma(
+    n = simulations*501,
+    shape = a,
+    scale = s
+  )
+  # Counter for traffic
+  counter.Tr = 1
+  
+  # Loop for simulations
+  total.df <- vector("list", 1e5)
+  for (sim in 1:simulations) {
+    
+    # Set chain size at 0 at the beginning of each simulation
+    Size.t = 0
+    
+    # Start simulation
+    rep.list <- vector("list", 1e5)
+    # use counter to store values in list
+    counter = 1
+    time.step = 1
+    
+    for (t in seq(0, 500, time.step)) { ## 254s is the longest of my reps
+      
+      # Draw random traffic at each time step
+      Tr <- Tr.vec[counter.Tr]
+      
+      # Calculate length of the chain
+      Length.chain = intercept.nlength + slope.nlength*Size.t
+      
+      # Calculate distance from the platform
+      gaplength = 20
+      
+      # Calculate decay rate 
+      w = Pl.complete*exp(R*gaplength)
+      w = ifelse(w > 1, 1, w)
+      
+      # Model
+      Size = Size.t + (Pj * Tr - w * Size.t)*(time.step)
+      
+      # Save size at each time step
+      # Size.t = ifelse(Size < 0, 0, Size)
+      Size.t <- Size
+      if (Size.t < 0) {Size.t = 0}
+      
+      # increase counter
+      counter = counter + 1
+      counter.Tr = counter.Tr + 1
+
+      # Store results of simulation
+      rep.list[[counter]] <- list(time = t,
+                                  S = Size.t,
+                                  L = Length.chain,
+                                  Tr = Tr.mean,
+                                  GapHeight = GH)
+      
+      # Stop loop when chain length covers full gap
+      if (Length.chain >= GH) {
+        break
+      }
+      
+    }
+    
+    # Output list 
+    total.df[[sim]] <- rbindlist(rep.list)
+    # Calculate slope for each simulation
+    slope = coefficients(lm(L ~ time, total.df[[sim]]))[2]
+    # Store slope results
+    total.df[[sim]][[6]] <- slope
+    names(total.df[[sim]])[[6]] <- "slope"
+    # Store simulation number
+    total.df[[sim]][[7]] <- sim
+    names(total.df[[sim]])[[7]] <- "simulation"
+    # Store iteration number
+    total.df[[sim]][[8]] <- i
+    names(total.df[[sim]])[[8]] <- "iteration"
+    
+
+  }
+  
+  # Put results in datatable
+  tot.df <- rbindlist(total.df)
+  
+  # Output list
+  tot.df
+  
+}
+
+### Run model ### 
+simulation.df_MP <- rbindlist(lapply(1:length(GapHeight.vec), simulateChain, GH.vec = GapHeight.vec, Tr.mean.vec = Traffic.mean.vec, simulations = 100))
+
+dat_MovPl <- simulation.df_MP
+
+dat_MovPl <- dat_MovPl %>%
+  group_by(GapHeight, Tr, time) %>%
+  summarise(L.avg = mean(L))
+dat_MovPl <- data.table(dat_MovPl)
+
+approxGrowth <- function(y, t) {
+  median(diff(y[order(t)]))
+}
+
+summ_MovPl <- dat_MovPl[, .(gr = approxGrowth(L.avg, time)), by = .(GapHeight, Tr)]
+
+# Plot tile plot
+SimulationTile_MovPlatform <- ggplot(subset(summ_MovPl, Tr <= 1), aes(x = GapHeight, y = Tr)) +
+  geom_tile(aes(fill = gr)) +
+  stat_contour(aes(z = gr), color = "white", breaks = seq(0.01, 2, 0.25), linetype = 2) +
+  stat_contour(aes(z = gr), color = "green", breaks = 0.01, linetype = 2) +
+  coord_equal(ratio = max(summ_MovPl$GapHeight) / max(summ_MovPl$Tr)) +
+  scale_x_continuous(expand=c(0,0)) +
+  scale_y_continuous(expand=c(0,0)) +
+  scale_fill_viridis_c(option = "inferno",
+                       name = "growth 
+rate (mm/s)") +
+  labs(x = "Gap height (mm)", 
+       y = "Traffic (ants/sec)",
+       title = " ") +
+  theme_minimal(base_size = 20) +
+  theme(legend.title = element_text(),
+        legend.justification = c(0, 1),
+        legend.margin = margin(100, 0 , 0, 0),
+        legend.spacing.y = unit(10, "pt")) 
+
+
+ggpar(SimulationTile_MovPlatform,
+      font.main = c(20, "bold"),
+      font.x = c(20, "bold"),
+      font.y = c(20, "bold"),
+      font.caption = c(20, "bold"),
+      
+      font.tickslab = c(20, "bold"))
+
+SimulationTile_MovPlatform
+
+```
+
+### . Growth rate of chains when distance from platform is constant
+
+```{r}
+
+GrowthMP <- read.csv("GrowthMP.csv") 
+traffic_mean <- read.csv("traffic_mean.csv")
+
+      ##### MODEL FITTING
+
+Pj = joining_probability # Probability of joining the chain
+duration <- max(GrowthMP$time_adj)
+Tr.mean <- traffic_mean$traffic.mean
+G.vec <- seq(2, 20, 1)
+timestep = 1
+Tr.variance.avg = traffic_mean$tr.var
+s = Tr.variance.avg/Tr.mean  
+a = Tr.mean/s
+
+# Estimated coefficients for decay rate calculation
+R = R_logmod$coefficients[2]
+Pl.complete = exp(R_logmod$coefficients[1])
+
+chain.size.MP = list()
+for (sim in 1:1000) {
+  
+  Tr.vec <- rgamma( ## Traffic vector extracted from gamma distribution
+    n = duration + 1,
+    shape = a,
+    scale = s
+  )
+  
+  # Set chain size at 0 (no ants in the chain)
+  Size.t = 0
+  for (t in seq(1, duration, timestep)) {
+
+    # Extract traffic rate
+    Tr = Tr.vec[t]
+    G = sample(G.vec, 1)
+
+    # Calculate length of the chain for current value of S
+    L = fixef(mod_nlength)[1] + fixef(mod_nlength)[2]*Size.t
+
+    # Calculate decay rate for current gaplength
+    w = Pl.complete*exp(R*G)
+    
+    # Find current size of chain
+    # Our model
+    Size = Size.t + (Pj * Tr - w * Size.t)*(timestep)
+    
+    # Store results for next time step
+    Size.t = Size
+    
+    # Export results
+    chain.size.MP[[length(chain.size.MP) + 1]] <- data.frame(time = t,
+                                                       simulation = sim,
+                                                       chainlength = L,
+                                                       S = Size)
+    
+  }
+  
+}
+
+# List to dataframe
+model.MP <- rbindlist(chain.size.MP) 
+
+model.MP <- model.MP %>%
+  group_by(time) %>%
+  mutate(
+    low = quantile(chainlength, probs = 0.05, na.rm = T), 
+    high = quantile(chainlength, probs = 0.95,  na.rm = T),
+    type = "Model") 
+
+GrowthMP <- GrowthMP %>%
+  mutate(
+    type = "Experimental"
+  )
+
+CompareMP_plot <- ggplot(model.MP, aes(x = time, y = chainlength, fill = type)) +
+  stat_summary(data = GrowthMP, aes(time_adj, chainlength, col = type), fun.data = mean_se, inherit.aes = F) +
+  stat_summary(fun.data = mean_se, geom = "line", size = 2, show.legend = T) +
+  geom_ribbon(aes(ymin = low, ymax = high), alpha = 0.3, show.legend = T) +
+  scale_fill_manual(name = "", values = c("#d95f02")) +
+  scale_color_manual(name = " ", values = c("#000000")) +
+  guides(color=guide_legend(override.aes=list(fill=NA, linetype=0)),
+         fill=guide_legend(override.aes=list())) +
+  xlab("Time (s)") +
+  ylab("Length of the chain (mm)") +
+  theme_pubr(base_size = 15) +
+  labs(title = '(C) Constant-distance experiment') +
+  theme(plot.title = element_text(face = "bold"),
+        axis.title = element_text(size = 17),
+        legend.key.size = unit(.9, "cm"),
+        legend.text = element_text(size = 20),
+        legend.position = c(0.1, 0.9),
+        legend.spacing.y = unit(0, "cm")); CompareMP_plot
+
+```
+
+
+# . Plot arrangement and export 
+
+```{r, eval=F}
+
+# Figure 2
+leaveplot_tfdw_nl <- leaveplot_tfdw +
+  theme(axis.title.y = element_blank(),
+        axis.title.x = element_text(size = 20),
+        title = element_text(size = 15)) 
+
+leaveplot_gl_nl <- leaveplot_gl +
+  theme(axis.title.y = element_blank(),
+        axis.title.x = element_text(size = 20),
+        title = element_text(size = 15))
+
+leaveplot_tfup_nl <- leaveplot_tfup +
+  theme(axis.title.x = element_text(size = 20),
+        title = element_text(size = 15),
+        axis.title.y = element_text(size = 15))
+
+join_plot2_nl <- join_plot2 +
+  theme(axis.title.x = element_text(size = 20), 
+        axis.text.x = element_text(size = 15),
+        axis.text.y = element_text(size = 12)
+        )
+
+ChainWalked_plot_nl <- ChainWalked_plot_upd +
+  ggtitle("Joining positions along chain") +
+  theme(axis.text.x = element_text(size = 15),
+        axis.title.x = element_text(size = 20),
+        title = element_text(size = 15),
+        axis.text.y = element_text(size = 15),
+        legend.title = element_text(size = 15),
+        axis.title.y = element_text(size = 20),
+        plot.title = element_text(face = "bold",
+                                  hjust = 0.5)) 
+
+## New plot for FIG 2
+
+leave_position_plot_nl <- leave_position_plot +
+  ggtitle("Leaving positions along chain") +
+  theme(axis.text.x = element_text(size = 15),
+        axis.title.x = element_text(size = 20),
+        title = element_text(size = 15),
+        axis.text.y = element_text(size = 15),
+        legend.title = element_text(size = 15),
+        axis.title.y = element_text(size = 20),
+        plot.title = element_text(face = "bold",
+                                  hjust = 0.5)) 
+  
+
+Fig2 <- ggarrange(ggarrange(ChainWalked_plot_nl, leave_position_plot_nl,join_plot2_nl,ncol = 3, labels = c("(A)", "(B)", "(C)"), 
+                            widths = c(0.35, 0.35, 0.3), hjust = c(-0.5, -0.5, -0.5)),
+                  ggarrange(leaveplot_tfup_nl, leaveplot_tfdw_nl, leaveplot_gl_nl, ncol = 3, labels = ("(D)"), hjust = -0.5),
+                  nrow = 2, heights = c(1, 0.85))
+
+tiff("Fig2_upd2.tiff", units = "in", width = 15, height = 9, res = 900)
+Fig2
+dev.off()
+
+tiff("Fig2_upd2.tiff", units = "in", width = 15, height = 9, res = 900)
+Fig2
+dev.off()
+
+# Figure 3
+
+avg.plot_nl <- avg.plot +
+  scale_x_continuous(breaks = c(0, 50, 100, 150, 200, 250), labels = c(0, "",100,"", 200, "")) +
+    theme(axis.title = element_text(size = 20), 
+        legend.title = element_text(size = 0),
+        legend.text = element_text(size = 20),
+        legend.key.size = unit(.9, 'cm')) 
+
+linearplot <- linearplot +
+  scale_x_continuous(breaks = c(0, 5, 10, 15, 20, 25), labels = c(0, "",10,"", 20, "")) +
+  theme(axis.title = element_text(size = 20), 
+        legend.title = element_text(size = 0),
+        legend.text = element_text(size = 20),
+        legend.key.size = unit(.9, 'cm')) 
+
+
+Fig3 <- ggarrange(avg.plot_nl, linearplot, common.legend = T, align = "v",
+                  labels = c("(A)", "(B)"),font.label = list(size = 20),  nrow = 2) ; Fig3
+
+tiff("Fig3.tiff", units = "in", width = 14, height = 20, res = 1200)
+Fig3
+dev.off()
+
+
+# Figure 4
+summ$Model <- "(A) Distance-dependent model"
+summ1$Model <- "(B) Distance-independent model"
+summ_MovPl$Model <- "(C) Constant-distance simulations"
+
+CompareSim <- rbind(summ, summ1)
+Myexps$Model <- "(A) Distance-dependent model"
+Myexps1 <- Myexps %>%
+  mutate(Model = "(B) Distance-independent model")
+Myexps <- rbind(Myexps, Myexps1)
+
+Fig4 <- ggplot(subset(CompareSim, Tr <= 1), aes(x = GapHeight, y = Tr)) +
+  facet_wrap2("Model", ncol = 1, axes = T, remove_labels = F) +
+  geom_tile(aes(fill = gr)) +
+  stat_contour(aes(z = gr), color = "white", breaks = seq(0.25, 2, 0.25), linetype = 2) +
+  stat_contour(aes(z = gr), color = "green", breaks = 0.01, linetype = 2) +
+  scale_x_continuous(expand=c(0,0)) +
+  scale_y_continuous(expand=c(0,0)) +
+  scale_fill_viridis_c(option = "inferno",
+                       name = "growth 
+rate 
+(mm/s)") +
+  labs(x = "Gap height (mm)", 
+       y = "Traffic (ants/sec)",
+       title = " ") +
+  theme_minimal(base_size = 12) +
+  theme(legend.title = element_text(size = 12),
+        legend.justification = c(0, 1),
+        legend.margin = margin(0, 0 , 0, 0),
+        strip.text = element_text(face = "bold", hjust = 0, size = 12))+
+  geom_point(data = Myexps, aes(GapHeight, mean.Tr), color = "white")
+
+
+CompareMP_plot <- ggplot(model.MP, aes(x = time, y = chainlength, fill = type)) +
+  stat_summary(data = GrowthMP, aes(time_adj, chainlength, col = type), fun.data = mean_se, inherit.aes = F, size = 0.3) +
+  stat_summary(fun.data = mean_se, geom = "line", size = 1, show.legend = T) +
+  geom_ribbon(aes(ymin = low, ymax = high), alpha = 0.3, show.legend = T) +
+  scale_fill_manual(name = "", values = c("#d95f02")) +
+  scale_color_manual(name = " ", values = c("#000000")) +
+  guides(color=guide_legend(override.aes=list(fill=NA, linetype=0)),
+         fill=guide_legend(override.aes=list())) +
+  xlab("Time (s)") +
+  ylab("Length of the chain (mm)") +
+  theme_pubr(base_size = 12) +
+  labs(title = '  (C) Constant-distance experiment') +
+  theme(plot.title = element_text(face = "bold", size = 12),
+        axis.title = element_text(size = 12),
+        legend.key.size = unit(.55, "cm"),
+        legend.text = element_text(size = 10),
+        legend.position = c(0.12, 0.9),
+        legend.spacing.y = unit(0, "cm")); CompareMP_plot
+
+Fig4_complete <- cowplot::plot_grid(Fig4, CompareMP_plot, 
+                       ncol = 1, rel_heights = c(2, 1),
+                       align = 'v', axis = 'lrtb') 
+
+
+tiff("Fig4_MP.tiff", units = "cm", width = 18, height = 30, res = 600)
+Fig4_complete
+dev.off()
+
+### SUPPLEMENTARY INFORMATION 
+
+#Lengthening a chain (Fig S1)
+tiff("FigS1.tiff", units = "in", width = 12, height = 10, res = 300)
+lengthen_plot
+dev.off()
+
+# Reaching behavior
+
+tiff("FigS2.tiff", units = "in", width = 12, height = 10, res = 300)
+extend_plot1
+dev.off()
+
+# Log Linear model
+FigS3 <- ggarrange(b, b1, b2, b3, labels = c("(A)", "(B)", "(C)", "(D)"),
+          hjust = -0.1, vjust = 1.2)
+
+tiff("FigS3.tiff", units = "in", width = 12, height = 12, res = 300)
+FigS3
+dev.off()
+
+
+# W by distance from visual target
+
+tiff("FigS4.tiff", units = "in", width = 12, height = 12, res = 300)
+wplot.complete
+dev.off()
+
+# Length of chain vs. Number of ants 
+tiff("FigS5.tiff", units = "in", width = 12, height = 12, res = 300)
+Nants_length_plot
+dev.off()
+
+# Replicate plot v. modelling
+tiff("FigS6.tiff", units = "in", width = 16, height = 12, res = 300)
+plotReps
+dev.off()
+
+# Complete simulations plots
+FigS8 <- ggplot(CompareSim, aes(x = GapHeight, y = Tr)) +
+  facet_wrap2("Model", ncol = 2, axes = T, remove_labels = F) +
+  geom_point(data = Myexps, aes(GapHeight, mean.Tr), color = "white") +
+  geom_tile(aes(fill = gr)) +
+  stat_contour(aes(z = gr), color = "white", breaks = seq(0.25, 2, 0.25), linetype = 2) +
+  stat_contour(aes(z = gr), color = "green", breaks = 0.01, linetype = 2) +
+  coord_equal(ratio = max(CompareSim$GapHeight) / max(CompareSim$Tr)) +
+  scale_x_continuous(expand=c(0,0)) +
+  scale_y_continuous(expand=c(0,0)) +
+  scale_fill_viridis_c(option = "inferno",
+                       name = "growth 
+rate (mm/s)") +
+  labs(x = "Gap height (mm)", 
+       y = "Traffic (ants/sec)",
+       title = " ") +
+  theme_minimal(base_size = 15) +
+  theme(legend.title = element_text(),
+        legend.justification = c(0, 1),
+        legend.margin = margin(0, 0 , 0, 0),
+        strip.text = element_text(face = "bold", hjust = 0)) +
+  geom_point(data = Myexps, aes(GapHeight, mean.Tr), color = "white")
+
+  
+tiff("FigS8.tiff", units = "in", width = 10, height = 6, res = 300)
+FigS8
+dev.off()
+
+
+```
