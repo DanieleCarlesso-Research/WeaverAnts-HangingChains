@@ -1,3 +1,5 @@
+[![DOI](https://zenodo.org/badge/654817092.svg)](https://zenodo.org/badge/latestdoi/654817092)
+
 This repository contains R code and datasets used for analyses in the paper: 
 
 “A simple mechanism for collective decision-making in the absence of payoff information” 
